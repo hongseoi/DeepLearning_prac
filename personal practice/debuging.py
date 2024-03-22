@@ -10,6 +10,9 @@ find_result = find_dog(sound)
 
 print(find_result)
 
+import torch
+
+print(torch.cuda.is_available())
 """
 - Variables: 변수
 - WATCH: 조사식
