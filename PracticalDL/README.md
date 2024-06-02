@@ -23,5 +23,10 @@ $$\log P_\theta(\centerdot |x_i) = \hat{y}_i = f_\theta(x_i)$$
 $$L(\theta) = -\frac{1}{N} \sum_{i=1}^N \log P(y=y_i|x=x_i;\theta) = - \frac{1}{N} \sum_{i=1}^N y_i^T \centerdot \hat{y_i}$$
 
 4. loss function 최소화하는 입력 파라미터 탐색작업 수행
+
+## training
+```
+python train.py --model_fn tmp.pth --gpu_id -1 --batch_size 256 --n_epochs 20 --n_layers 5
+```
 ### Reference
 - [Ki's Blog의 Practical Exerciese 챕터](https://kh-kim.github.io/nlp_with_deep_learning_blog/docs/1-15-practical_exercise/03-exercise_briefing/)
