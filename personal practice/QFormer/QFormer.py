@@ -47,28 +47,36 @@ from transformers.models.bert.configuration_bert import BertConfig
 
 logger = logging.get_logger(__name__)
 
-# BERT 모델에서 입력 임베딩 생성
+# ? BERT 모델에서 입력 임베딩 생성: 단어 임베딩과 위치 임베딩, 쿼리 임베딩 결합해 입력 시퀸스 표현
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word and position embeddings."""
 
     def __init__(self, config):
         super().__init__()
+        
+        # 단어 임베딩
         self.word_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
         )
+        
+        # 위치 임베딩
         self.position_embeddings = nn.Embedding(
             config.max_position_embeddings, config.hidden_size
         )
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
+        # 레이저 정규화 정의
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # 레이어 드롭아웃 정의
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.register_buffer(
+        self.register_buffer( # position_ids를 생성하고 버퍼로 등록
             "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
         )
+        
+        # position embedding 타입 absolute로 설정
         self.position_embedding_type = getattr(
             config, "position_embedding_type", "absolute"
         )
@@ -82,36 +90,47 @@ class BertEmbeddings(nn.Module):
         query_embeds=None,
         past_key_values_length=0,
     ):
+        # input_ids 주어지면 입력 시퀸스의 길이 계산
         if input_ids is not None:
             seq_length = input_ids.size()[1]
         else:
             seq_length = 0
 
+        # position_ids가 없으면 생성
         if position_ids is None:
             position_ids = self.position_ids[
                 :, past_key_values_length : seq_length + past_key_values_length
             ].clone()
 
+        # inpur_ids가 주어지면 word_embedding 계산
         if input_ids is not None:
             embeddings = self.word_embeddings(input_ids)
+            
+            # position_embedding type이 absolute인 경우: word embedding + position_embedding
             if self.position_embedding_type == "absolute":
                 position_embeddings = self.position_embeddings(position_ids)
-                embeddings = embeddings + position_embeddings
+                embeddings = embeddings + position_embeddings 
 
+            # query_embedding이 주어지는 경우: word embedding + position_embedding + query_embedding
             if query_embeds is not None:
                 embeddings = torch.cat((query_embeds, embeddings), dim=1)
+        
+        # input_ids가 없는 경우: qeury_embedding
         else:
             embeddings = query_embeds
 
+        # 임베딩 정규화 및 드롭아웃
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
 
-# BERT의 Self attention 구현
+# ? BERT의 Self attention 구현
 class BertSelfAttention(nn.Module):
     def __init__(self, config, is_cross_attention):
         super().__init__()
-        self.config = config
+        self.config = config # config 매개변수를 인스턴스 변수로 저장
+        
+        # size 안 맞을 경우 에러
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(
             config, "embedding_size"
         ):
@@ -120,22 +139,31 @@ class BertSelfAttention(nn.Module):
                 "heads (%d)" % (config.hidden_size, config.num_attention_heads)
             )
 
+        # attention head 수, 크기 설정
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
+        # linear 레이어를 query 변수에 설정
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        
+        # cross attention인 경우, key와 value 생성
         if is_cross_attention:
             self.key = nn.Linear(config.encoder_width, self.all_head_size)
             self.value = nn.Linear(config.encoder_width, self.all_head_size)
+        
+        # cross attention 아닌 경우 key와 value 생성
         else:
             self.key = nn.Linear(config.hidden_size, self.all_head_size)
             self.value = nn.Linear(config.hidden_size, self.all_head_size)
-
+        
+        # 드롭아웃 및 위치 임베딩 정의
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = getattr(
             config, "position_embedding_type", "absolute"
         )
+        
+        # ! relative 위치 임베딩 사용하는 경우 
         if (
             self.position_embedding_type == "relative_key"
             or self.position_embedding_type == "relative_key_query"
@@ -162,16 +190,17 @@ class BertSelfAttention(nn.Module):
     def get_attention_map(self):
         return self.attention_map
 
-    # attention score 계산을 위한 텐서 변환
+    # attention score 계산을 위한 x의 shape 변환
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (
             self.num_attention_heads,
             self.attention_head_size,
         )
+        # x 크기 변경
         x = x.view(*new_x_shape)
+        # x의 차원 변경
         return x.permute(0, 2, 1, 3)
 
-    # self attention 연산 수행
     def forward(
         self,
         hidden_states,
@@ -188,53 +217,83 @@ class BertSelfAttention(nn.Module):
         # such that the encoder's padding tokens are not attended to.
         is_cross_attention = encoder_hidden_states is not None
 
+        # cross attention인 경우 key value 설정
         if is_cross_attention:
             key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
             value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
             attention_mask = encoder_attention_mask
+        
+        # 과거 key-value가 있는 경우
         elif past_key_value is not None:
             key_layer = self.transpose_for_scores(self.key(hidden_states))
             value_layer = self.transpose_for_scores(self.value(hidden_states))
+            
+            # 과거 key-value와 현재 key-value를 합침
             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
+            
         else:
             key_layer = self.transpose_for_scores(self.key(hidden_states))
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
+        # hidden state에 query(선형변환) 적용
         mixed_query_layer = self.query(hidden_states)
 
+        # shape 변경
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
+        # 현재 key-value를 past_key_value에 저장
         past_key_value = (key_layer, value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
+        # position embedding type이 relative key 인 경우
+        # ! 상대적 위치 임베딩???
         if (
             self.position_embedding_type == "relative_key"
             or self.position_embedding_type == "relative_key_query"
         ):
+            # 입력 시퀸스 길이
             seq_length = hidden_states.size()[1]
+            
+            # 왼쪽 위치 인덱스. sequence 길이 만큼의 1차원 텐서 생성 후 (seq_length, 1)로 크기 변환
             position_ids_l = torch.arange(
                 seq_length, dtype=torch.long, device=hidden_states.device
             ).view(-1, 1)
+            
+            # 오른쪽 위치 인텍스. 시퀸스 길이만큼의 1차원 텐서 생성 후 (1, seq_length)로 크기 변환
             position_ids_r = torch.arange(
                 seq_length, dtype=torch.long, device=hidden_states.device
             ).view(1, -1)
+            
+            # 두 position index간 차이 계산해 각 위치쌍의 상대적 거리 나타내는 텐서 생성
             distance = position_ids_l - position_ids_r
+            
+            # ! position embedding 계산: 상대적 거리를 정수 값으로 변환하여 임베딩 레이어에 입력합니다. 이는 거리 값이 음수가 되지 않도록 조정하는 과정
             positional_embedding = self.distance_embedding(
                 distance + self.max_position_embeddings - 1
             )
+            
+            # position embedding과 query_layer의 dtype 맞춤 
             positional_embedding = positional_embedding.to(
                 dtype=query_layer.dtype
             )  # fp16 compatibility
 
+            # position_embedding type이 relative key인 경우
             if self.position_embedding_type == "relative_key":
-                relative_position_scores = torch.einsum(
+                # einsum 표기법을 사용해 query layer와 positional embedding 간 dot product 계산해서 상대적 위치 score
+                relative_position_scores = torch.einsum( # ! einsum이 뭐여
                     "bhld,lrd->bhlr", query_layer, positional_embedding
                 )
+                
+                # 기존 attention score + 상대적 위치 score
                 attention_scores = attention_scores + relative_position_scores
+                
+            # position embedding type이 relative_key_query인 경우    
             elif self.position_embedding_type == "relative_key_query":
+                
+                # einsum 표기법을 사용해 query layer와 positional embedding 간 dot product 계산해서 key, query의 상대적 위치 score                
                 relative_position_scores_query = torch.einsum(
                     "bhld,lrd->bhlr", query_layer, positional_embedding
                 )
@@ -246,8 +305,10 @@ class BertSelfAttention(nn.Module):
                     + relative_position_scores_query
                     + relative_position_scores_key
                 )
-
+        # ateention score 계산
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        
+        # ! attention mask 있으면 attention mask를 적용하여 attention score 다시 계산
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
             attention_scores = attention_scores + attention_mask
@@ -255,20 +316,25 @@ class BertSelfAttention(nn.Module):
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
 
+        # cross attention이 활성화되어있고 save_attention이 지정된 경우
         if is_cross_attention and self.save_attention:
-            self.save_attention_map(attention_probs)
-            attention_probs.register_hook(self.save_attn_gradients)
+            self.save_attention_map(attention_probs) # 계산된 attention probs 저장
+            attention_probs.register_hook(self.save_attn_gradients) # attention probs에 대한 gradient를 저장하기 위한 hook 등록
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
+        # 과적합 방지를 위해 어텐션 확률의 일부를 무작위로 0으로 설정
         attention_probs_dropped = self.dropout(attention_probs)
 
         # Mask heads if we want to
         if head_mask is not None:
+            # 특정 어텐션 헤드 무시
             attention_probs_dropped = attention_probs_dropped * head_mask
 
+        # attention prob와 value를 곱해서 context layer 생성
         context_layer = torch.matmul(attention_probs_dropped, value_layer)
 
+        # context layer의 shape 변경
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
@@ -276,11 +342,12 @@ class BertSelfAttention(nn.Module):
         outputs = (
             (context_layer, attention_probs) if output_attentions else (context_layer,)
         )
-
+        
+        # ! 왜더함? elment wise가 아니라 concat임?
         outputs = outputs + (past_key_value,)
         return outputs
 
-# self attention의 출력 부분 처리
+# ? self attention의 출력 부분 처리: dense-dropout-layernorm
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -294,23 +361,23 @@ class BertSelfOutput(nn.Module):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
-# BERT의 전체 Attention 모듈 구현
+# !!!!! BERT의 전체 Attention 모듈 구현
 class BertAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False):
         super().__init__()
         self.self = BertSelfAttention(config, is_cross_attention)
         self.output = BertSelfOutput(config)
-        self.pruned_heads = set()
+        self.pruned_heads = set() # 제거된 attention head 추적
 
     # 특정 Attention head 제거
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
-        heads, index = find_pruneable_heads_and_indices(
-            heads,
-            self.self.num_attention_heads,
-            self.self.attention_head_size,
-            self.pruned_heads,
+        heads, index = find_pruneable_heads_and_indices( # !! 주어진 head 리스트에서 이미 제거된 head를 제외하고 실제로 제거할 head를 식별하여 해당 인덱스 반환
+            heads, # 제거할 head의 인덱스 리스트
+            self.self.num_attention_heads, # 레이어의 attention head 수
+            self.self.attention_head_size, # 각 attention head의 size
+            self.pruned_heads, # 이미 제거된 head
         )
 
         # Prune linear layers
@@ -352,22 +419,22 @@ class BertAttention(nn.Module):
         ]  # add attentions if we output them
         return outputs
 
-# intermediate 레이어 구현
+# ? BERT의 FeedForward Network의 첫번째 부분 구현: dense-activation
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
+            self.intermediate_act_fn = ACT2FN[config.hidden_act] # 해당 문자열에 해당하는 활성화함수 가져옴
         else:
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states):
         hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.intermediate_act_fn(hidden_states) # 활성화함수 적용
         return hidden_states
 
-# BERT의 추력 레이어 구현
+# ? BERT의 FeedForward Network 두번째 부분: dense-dropout-residual+layernrom
 class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -378,10 +445,10 @@ class BertOutput(nn.Module):
     def forward(self, hidden_states, input_tensor):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor) # residual connection 및 layernorm
         return hidden_states
 
-# BERT 단일 레이어 구현
+# ? BERT 단일 레이어 구현. attention과 피드포워드 신경망 레이어를 결합
 class BertLayer(nn.Module):
     def __init__(self, config, layer_num):
         super().__init__()
@@ -492,7 +559,7 @@ class BertLayer(nn.Module):
         layer_output = self.output_query(intermediate_output, attention_output)
         return layer_output
 
-
+# ? 여러가지 BERT 레이어를 결합하여 인코더를 구성
 class BertEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -597,7 +664,7 @@ class BertEncoder(nn.Module):
             cross_attentions=all_cross_attentions,
         )
 
-
+# ? 인코더의 출력을 POOLING하여 고정된 크기의 벡터로 변환 (일반적으로 문장 분류 작업에 사용)
 class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -612,7 +679,7 @@ class BertPooler(nn.Module):
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
-# prediction head 변환 구현
+# BERT의 언어 모델링 헤드(MLM) 구현. 다음단어 예측에 사용
 class BertPredictionHeadTransform(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -629,7 +696,7 @@ class BertPredictionHeadTransform(nn.Module):
         hidden_states = self.LayerNorm(hidden_states)
         return hidden_states
 
-# LM Prediction head
+# BERT의 언어 모델링 헤드(MLM) 구현. 다음단어 예측에 사용
 class BertLMPredictionHead(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -659,7 +726,7 @@ class BertOnlyMLMHead(nn.Module):
         prediction_scores = self.predictions(sequence_output)
         return prediction_scores
 
-# pretrained BERT 모델
+# pretrained BERT 모델 다루는 클래스
 class BertPreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
@@ -681,8 +748,8 @@ class BertPreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
-
-
+# =================================================================
+# BERT의 전체 모델 구현
 class BertModel(BertPreTrainedModel):
     """
     The model can behave as an encoder (with only self-attention) as well as a decoder, in which case a layer of
@@ -973,7 +1040,7 @@ class BertModel(BertPreTrainedModel):
             cross_attentions=encoder_outputs.cross_attentions,
         )
 
-
+# 언어모델링을 위한 BERT 모델 구현
 class BertLMHeadModel(BertPreTrainedModel):
 
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
@@ -1136,7 +1203,7 @@ class BertLMHeadModel(BertPreTrainedModel):
             )
         return reordered_past
 
-# Masked Language Modeling Head를 위한 구현
+# ? 마스크드 언어 모델링(MLM)을 위한 BERT 모델을 구현
 class BertForMaskedLM(BertPreTrainedModel):
 
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
