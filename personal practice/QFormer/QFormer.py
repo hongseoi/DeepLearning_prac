@@ -343,7 +343,7 @@ class BertSelfAttention(nn.Module):
             (context_layer, attention_probs) if output_attentions else (context_layer,)
         )
         
-        # ! 왜더함? elment wise가 아니라 concat임?
+        # ! ??? 왜 context_layer + past_key_value ?
         outputs = outputs + (past_key_value,)
         return outputs
 
@@ -365,8 +365,8 @@ class BertSelfOutput(nn.Module):
 class BertAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False):
         super().__init__()
-        self.self = BertSelfAttention(config, is_cross_attention)
-        self.output = BertSelfOutput(config)
+        self.self = BertSelfAttention(config, is_cross_attention) # self attention
+        self.output = BertSelfOutput(config) # hidden state output
         self.pruned_heads = set() # 제거된 attention head 추적
 
     # 특정 Attention head 제거
@@ -380,30 +380,32 @@ class BertAttention(nn.Module):
             self.pruned_heads, # 이미 제거된 head
         )
 
-        # Prune linear layers
+        # 해당 head의 qkv 제거 
         self.self.query = prune_linear_layer(self.self.query, index)
         self.self.key = prune_linear_layer(self.self.key, index)
         self.self.value = prune_linear_layer(self.self.value, index)
-        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
+        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1) # 관련 선형 레이어 제거
 
         # Update hyper params and store pruned heads
         self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
         self.self.all_head_size = (
             self.self.attention_head_size * self.self.num_attention_heads
         )
-        self.pruned_heads = self.pruned_heads.union(heads)
+        self.pruned_heads = self.pruned_heads.union(heads) # pruned_heads에 제거된 head index 리스트 추가
 
     def forward(
         self,
         hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
+        attention_mask=None, # 입력 시퀸스의 padding 토큰 제거하기 위해 사용
+        head_mask=None, # 특정 attention head 마스킹 위해 사용
+        encoder_hidden_states=None, # decoder에서 cross attention 수행할 때 사용
         encoder_attention_mask=None,
-        past_key_value=None,
-        output_attentions=False,
+        past_key_value=None, # 이전 timestep의 qkv (캐싱을 이용해 속도 높이기 위해 사용)
+        output_attentions=False, # attention 출력 반환여부
     ):
-        self_outputs = self.self(
+        
+        # self attention 수행
+        self_outputs = self.self( # self: BertSelfAttention
             hidden_states,
             attention_mask,
             head_mask,
@@ -412,7 +414,9 @@ class BertAttention(nn.Module):
             past_key_value,
             output_attentions,
         )
-        attention_output = self.output(self_outputs[0], hidden_states)
+        
+        # linear - dropout - layernorm 수행
+        attention_output = self.output(self_outputs[0], hidden_states) # hidden state, input tensor
 
         outputs = (attention_output,) + self_outputs[
             1:
@@ -424,9 +428,11 @@ class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act] # 해당 문자열에 해당하는 활성화함수 가져옴
-        else:
+        
+        # FFN에서 사용할 act_fn 설정
+        if isinstance(config.hidden_act, str): # hidden_act가 str인지 확인
+            self.intermediate_act_fn = ACT2FN[config.hidden_act] # 해당 문자열에 해당하는 활성화함수 가져옴. ACTFN은 활성화 함수 이름을 실제 함수로 매핑하는 딕셔너리
+        else: # 이미 함수 객체인 경우
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states):
@@ -435,7 +441,7 @@ class BertIntermediate(nn.Module):
         return hidden_states
 
 # ? BERT의 FeedForward Network 두번째 부분: dense-dropout-residual+layernrom
-class BertOutput(nn.Module):
+class BertOutput(nn.Module): # ! BERFSELFOUTPUT()과 다른 점? 똑같음
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
@@ -453,10 +459,12 @@ class BertLayer(nn.Module):
     def __init__(self, config, layer_num):
         super().__init__()
         self.config = config
-        self.chunk_size_feed_forward = config.chunk_size_feed_forward
-        self.seq_len_dim = 1
-        self.attention = BertAttention(config)
-        self.layer_num = layer_num
+        self.chunk_size_feed_forward = config.chunk_size_feed_forward #config에서 불러와서 인스턴스 변수로 저장. ffn에서 입력을 chnnk 단위로 처리할 때 사용
+        self.seq_len_dim = 1 # 시퀸스 길이 차원(입력 텐서 (batch_size, sequence_length, hidden_size) 중 sequence length는 1번째라는뜻!)
+        self.attention = BertAttention(config) # attention 담당
+        self.layer_num = layer_num # 레이어 개수? index?
+        
+        # add_cross_attention이 True이고 layer_num을 cross attention frequency로 나눈 나머지가 0인 경우 cross attention 수행
         if (
             self.config.add_cross_attention
             and layer_num % self.config.cross_attention_freq == 0
@@ -465,8 +473,11 @@ class BertLayer(nn.Module):
                 config, is_cross_attention=self.config.add_cross_attention
             )
             self.has_cross_attention = True
+        
         else:
             self.has_cross_attention = False
+        
+        # 계산    
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
 
@@ -485,9 +496,12 @@ class BertLayer(nn.Module):
         query_length=0,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        # 과거 key, value 값 가져오기
         self_attn_past_key_value = (
             past_key_value[:2] if past_key_value is not None else None
         )
+        
+        # self attention 수행
         self_attention_outputs = self.attention(
             hidden_states,
             attention_mask,
@@ -498,11 +512,13 @@ class BertLayer(nn.Module):
         attention_output = self_attention_outputs[0]
         outputs = self_attention_outputs[1:-1]
 
+        # 현재 key value 값
         present_key_value = self_attention_outputs[-1]
 
         if query_length > 0:
             query_attention_output = attention_output[:, :query_length, :]
 
+            # cross attention 수행
             if self.has_cross_attention:
                 assert (
                     encoder_hidden_states is not None
@@ -520,12 +536,15 @@ class BertLayer(nn.Module):
                     outputs + cross_attention_outputs[1:-1]
                 )  # add cross attentions if we output attention weights
 
+            # query feed forward 수행
             layer_output = apply_chunking_to_forward(
                 self.feed_forward_chunk_query,
                 self.chunk_size_feed_forward,
                 self.seq_len_dim,
                 query_attention_output,
             )
+            
+            # query_length보다 긴 경우 잘라내서 수행
             if attention_output.shape[1] > query_length:
                 layer_output_text = apply_chunking_to_forward(
                     self.feed_forward_chunk,
@@ -534,6 +553,8 @@ class BertLayer(nn.Module):
                     attention_output[:, query_length:, :],
                 )
                 layer_output = torch.cat([layer_output, layer_output_text], dim=1)
+        
+        # cross attention 안하는 경우
         else:
             layer_output = apply_chunking_to_forward(
                 self.feed_forward_chunk,
@@ -564,6 +585,8 @@ class BertEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        
+        # BERTLAYER 객체를 num_hidden_layers 만큼 생성해서 ModuleList에 저장
         self.layer = nn.ModuleList(
             [BertLayer(config, i) for i in range(config.num_hidden_layers)]
         )
@@ -582,30 +605,36 @@ class BertEncoder(nn.Module):
         return_dict=True,
         query_length=0,
     ):
+        # 각 변수 초기화
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = (
             () if output_attentions and self.config.add_cross_attention else None
         )
 
+        # 디코더 캐시 저장 변수 초기화
         next_decoder_cache = () if use_cache else None
 
+        # 각 레이어에 대해 순차적 연산 수행
         for i in range(self.config.num_hidden_layers):
-            layer_module = self.layer[i]
+            layer_module = self.layer[i]    # 현재 레이어
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
+            # 현재 레이어에서의 head_mask와 past kv 설정
             layer_head_mask = head_mask[i] if head_mask is not None else None
             past_key_value = past_key_values[i] if past_key_values is not None else None
 
+            # gradient_checkpointing가 False이고 training 중인 경우
             if getattr(self.config, "gradient_checkpointing", False) and self.training:
-
+                    
                 if use_cache:
                     logger.warn(
                         "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
                     )
                     use_cache = False
 
+                # torch.utils.checkpoint와 함께 사용될 커스텀 forward 함수 생성
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         return module(
@@ -622,6 +651,7 @@ class BertEncoder(nn.Module):
                     encoder_hidden_states,
                     encoder_attention_mask,
                 )
+            # gradient_checkpointing가 True 또는 training 중이 아닌 경우
             else:
                 layer_outputs = layer_module(
                     hidden_states,
@@ -634,16 +664,23 @@ class BertEncoder(nn.Module):
                     query_length,
                 )
 
+            # 현재 레이어 출력인 hidden state 업데이터
             hidden_states = layer_outputs[0]
+            
+            # 캐시 저장
             if use_cache:
                 next_decoder_cache += (layer_outputs[-1],)
+                
+            # self attention과 cross attention 가중치 저장
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
                 all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
 
+        # hidden state 저장
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
+        # dictionary가 아니라 tuple로 반환
         if not return_dict:
             return tuple(
                 v
@@ -656,6 +693,8 @@ class BertEncoder(nn.Module):
                 ]
                 if v is not None
             )
+        
+        # return_dict==True인 경우
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_decoder_cache,
@@ -672,10 +711,11 @@ class BertPooler(nn.Module):
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
+        # BERT encoder의 출력 hidden state의 첫번째 토큰의 hidden state 출력
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
-        first_token_tensor = hidden_states[:, 0]
-        pooled_output = self.dense(first_token_tensor)
+        first_token_tensor = hidden_states[:, 0] 
+        pooled_output = self.dense(first_token_tensor) 
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
@@ -690,6 +730,7 @@ class BertPredictionHeadTransform(nn.Module):
             self.transform_act_fn = config.hidden_act
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
+    # hidden state에 변환 적용
     def forward(self, hidden_states):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.transform_act_fn(hidden_states)
@@ -758,6 +799,11 @@ class BertModel(BertPreTrainedModel):
     Llion Jones, Aidan N. Gomez, Lukasz Kaiser and Illia Polosukhin.
     argument and :obj:`add_cross_attention` set to :obj:`True`; an :obj:`encoder_hidden_states` is then expected as an
     input to the forward pass.
+    
+    동일 모델이 encoder로도, decoder로도 사용 가능
+    encoder: self attention만 사용하는 경우
+    decoder: self attention + cross attention 사용하는 경우
+    
     """
 
     def __init__(self, config, add_pooling_layer=False):
@@ -772,12 +818,16 @@ class BertModel(BertPreTrainedModel):
 
         self.init_weights()
 
+    # word embedding 반환
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
 
+    # word embedding 설정
     def set_input_embeddings(self, value):
         self.embeddings.word_embeddings = value
 
+    # ??? 특정 attention head는 왜 제거함?
+    # 특정 attention head 제거
     def _prune_heads(self, heads_to_prune):
         """
         Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
@@ -786,13 +836,14 @@ class BertModel(BertPreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.encoder.layer[layer].attention.prune_heads(heads)
 
+    # ! attention mask 생성(이부분이 중요한것으로 예상)
     def get_extended_attention_mask(
         self,
         attention_mask: Tensor,
-        input_shape: Tuple[int],
-        device: device,
+        input_shape: Tuple[int], #모델의 입력 데이터 형태
+        device: device, # 모델에 입력되는 데이터 디바이스
         is_decoder: bool,
-        has_query: bool = False,
+        has_query: bool = False, # 쿼리 있는지 여부 나타내는 flag
     ) -> Tensor:
         """
         Makes broadcastable attention and causal masks so that future and masked tokens are ignored.
@@ -807,15 +858,38 @@ class BertModel(BertPreTrainedModel):
 
         Returns:
             :obj:`torch.Tensor` The extended attention mask, with a the same dtype as :obj:`attention_mask.dtype`.
+        
+        ****************************************************************
+        broadcastable attention and causal masks를 만들어서 미래의 토큰과 마스킹된 토큰이 무시되도록 합니다.
+        - broadcastable attention: 마스크를 여러 attention head에 적용하기 쉽도록 만든 형태. 즉 동일 mask를 여러 attention에 적용할 수 있도록 텐서 차원 확장
+        - casual mask: 주로 decoder에서 사용되며 모델이 미래 토큰을 보지못하게 함
+        인자:
+            attention_mask (:obj:`torch.Tensor`):
+                주의해야 할 토큰을 나타내는 1과 무시해야 할 토큰을 나타내는 0으로 구성된 마스크.
+                어떤 토큰을 집중할지, 무시할지 결정
+            input_shape (:obj:`Tuple[int]`):
+                모델에 입력되는 데이터의 형태.
+            device: (:obj:`torch.device`):
+                모델에 입력되는 데이터의 디바이스.
+
+        return:
+            :obj:`torch.Tensor` 확장된 어텐션 마스크로, :obj:`attention_mask.dtype`과 같은 데이터 타입을 가집니다.
+
         """
-        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # ourselves in which case we just need to make it broadcastable to all heads.
+        # ? We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+        # ? ourselves in which case we just need to make it broadcastable to all heads.
+        # [batch_size, from_seq_length, to_seq_length] 형태로 3차원
         if attention_mask.dim() == 3:
+            # broadcasting을 이용해 attention mask shape를 [batch_size, 1, from_seq_length, to_seq_length] 형태로 확장하여 여러 어텐션 헤드에 브로드캐스트할 수 있게 만듦
             extended_attention_mask = attention_mask[:, None, :, :]
+        
+        # attention mask가 2차원: [batch_size, seq_length]
         elif attention_mask.dim() == 2:
-            # Provided a padding mask of dimensions [batch_size, seq_length]
-            # - if the model is a decoder, apply a causal mask in addition to the padding mask
-            # - if the model is an encoder, make the mask broadcastable to [batch_size, num_heads, seq_length, seq_length]
+            # ?Provided a padding mask of dimensions [batch_size, seq_length]
+            # ? - if the model is a decoder, apply a causal mask in addition to the padding mask
+            # ? - if the model is an encoder, make the mask broadcastable to [batch_size, num_heads, seq_length, seq_length]
+            
+            # decoder인 경우: casual mask + padding mask
             if is_decoder:
                 batch_size, seq_length = input_shape
 
@@ -857,9 +931,11 @@ class BertModel(BertPreTrainedModel):
                 extended_attention_mask = (
                     causal_mask[:, None, :, :] * attention_mask[:, None, None, :]
                 )
+            # encoder 인 경우: 마스크를 [batch_size, 1, 1, seq_length] 형태로 확장하여 여러 어텐션 헤드에 브로드캐스트할 수 있게 함
             else:
                 extended_attention_mask = attention_mask[:, None, None, :]
         else:
+            # attention mask가 1차원 > 오류임
             raise ValueError(
                 "Wrong shape for input_ids (shape {}) or attention_mask (shape {})".format(
                     input_shape, attention_mask.shape
@@ -871,10 +947,16 @@ class BertModel(BertPreTrainedModel):
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
+        
+        # attention_mask가 주의해야 할 위치에 대해 1.0, 마스킹된 위치에 대해 0.0
+        # 아래 연산은 주의해야 할 위치에 대해 0.0을, 마스킹된 위치에 대해 -10000.0을 가지는 텐서를 생성합니다.
+        # 이 값을 소프트맥스 이전의 raw score에 더하기 때문에, 이는 실질적으로 마스킹된 위치를 완전히 제거하는 것과 동일한 효과를 줍니다.
+
         extended_attention_mask = extended_attention_mask.to(
             dtype=self.dtype
         )  # fp16 compatibility
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0 #주의해야할 위치: (1.0-1.0)*-10000, 마스킹된 위치: (1.0-0.0)*-100000
+        # 주의할 위치는 0, 마스킹 위치는 -100000으로 설정하여 SOFTMAX 적용시 확률을 거의 0으로 만든다
         return extended_attention_mask
 
     def forward(
@@ -883,10 +965,10 @@ class BertModel(BertPreTrainedModel):
         attention_mask=None,
         position_ids=None,
         head_mask=None,
-        query_embeds=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_values=None,
+        query_embeds=None, # decoder에서 사용되는 경우 입력 시퀸스 외부의 추가정보, 즉 이미지에 대한 정보 제공
+        encoder_hidden_states=None, # encoder의 마지막 layer의 hidden state. 모델이 decoder로 사용되는 경우 cross attention에 사용
+        encoder_attention_mask=None, # [1,0]으로 표현되는 attention mask. 모델이 decoder로 사용되는 경우 cross attention에 사용
+        past_key_values=None, # attention에서 미리 계산된 kv의 hidden state
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
@@ -911,6 +993,8 @@ class BertModel(BertPreTrainedModel):
             If set to :obj:`True`, :obj:`past_key_values` key value states are returned and can be used to speed up
             decoding (see :obj:`past_key_values`).
         """
+        
+        # config를 이용한 파라미터 기본값 설정
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -927,6 +1011,7 @@ class BertModel(BertPreTrainedModel):
 
         # use_cache = use_cache if use_cache is not None else self.config.use_cache
 
+        # input_ids가 none인 경우 query_embeds 반드시 필요
         if input_ids is None:
             assert (
                 query_embeds is not None
@@ -934,33 +1019,35 @@ class BertModel(BertPreTrainedModel):
 
         # past_key_values_length
         past_key_values_length = (
-            past_key_values[0][0].shape[2] - self.config.query_length
+            past_key_values[0][0].shape[2] - self.config.query_length # pask_key_value의 길이 - qeury_length
             if past_key_values is not None
-            else 0
+            else 0 # past_key_value 없으면 0
         )
 
+        # query 길이 계산
         query_length = query_embeds.shape[1] if query_embeds is not None else 0
 
+        # embedding 생성
         embedding_output = self.embeddings(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            query_embeds=query_embeds,
-            past_key_values_length=past_key_values_length,
+            input_ids=input_ids, # 입력 토큰 아이디
+            position_ids=position_ids, # 입력 토큰 위치 id
+            query_embeds=query_embeds, # ! learned query
+            past_key_values_length=past_key_values_length,#이전 kv 길이(현재단계의 위치 인덱스 조정에 사용)
         )
 
-        input_shape = embedding_output.size()[:-1]
+        input_shape = embedding_output.size()[:-1] # embedding output에서 마지막 차원 제외 가져옴. [batch size, seq length]
         batch_size, seq_length = input_shape
         device = embedding_output.device
 
-        if attention_mask is None:
+        if attention_mask is None: # attention mask 없는 경우 모든 위치가 1인 mask 생성
             attention_mask = torch.ones(
                 ((batch_size, seq_length + past_key_values_length)), device=device
             )
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
-        if is_decoder:
-            extended_attention_mask = self.get_extended_attention_mask(
+        if is_decoder: # decoder인 경우
+            extended_attention_mask = self.get_extended_attention_mask( # ??? extended mask의 역할 casual mask, padding mask로 attention mask 구성
                 attention_mask,
                 input_ids.shape,
                 device,
@@ -972,50 +1059,58 @@ class BertModel(BertPreTrainedModel):
                 attention_mask, input_shape, device, is_decoder
             )
 
+        # cross attention 적용시 사용
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if encoder_hidden_states is not None:
+        if encoder_hidden_states is not None: # hidden state 존재할 경우 cross attention에 다음 정보 활용
             if type(encoder_hidden_states) == list:
                 encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states[
                     0
                 ].size()
-            else:
+            else: # encoder_hidden_state == None인 경우 크기 직접 가져옴
                 (
                     encoder_batch_size,
                     encoder_sequence_length,
                     _,
                 ) = encoder_hidden_states.size()
+                
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
 
+            # encoder_attention_mask == list이면 각 mask를 invert_attention_mask()를 이용해 변환
             if type(encoder_attention_mask) == list:
                 encoder_extended_attention_mask = [
                     self.invert_attention_mask(mask) for mask in encoder_attention_mask
                 ]
+            
+            # encoder_attention_mask == None 이면 ones 이용해 직접 생성 후 변환
             elif encoder_attention_mask is None:
                 encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
                 encoder_extended_attention_mask = self.invert_attention_mask(
                     encoder_attention_mask
                 )
+            # 그외 
             else:
-                encoder_extended_attention_mask = self.invert_attention_mask(
+                encoder_extended_attention_mask = self.invert_attention_mask( # attention mask 값 반전
                     encoder_attention_mask
                 )
+        # encoder_hidden_state ==None인 경우
         else:
             encoder_extended_attention_mask = None
 
-        # Prepare head mask if needed
+        # ! Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
         # attention_probs has shape bsz x n_heads x N x N
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
+        # encoder
         encoder_outputs = self.encoder(
-            embedding_output,
-            attention_mask=extended_attention_mask,
-            head_mask=head_mask,
+            embedding_output, # input embedding tensor
+            attention_mask=extended_attention_mask, #입력 시퀸스의 패딩 토큰 무시
+            head_mask=head_mask,# 특정 attention head 무시
             encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_extended_attention_mask,
+            encoder_attention_mask=encoder_extended_attention_mask, # 디코더에서 cross attention 수행시 인코더의 padding token 무시 위해 사용
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -1023,7 +1118,11 @@ class BertModel(BertPreTrainedModel):
             return_dict=return_dict,
             query_length=query_length,
         )
+        
+        # encoder의 첫번째 요소, 즉 encoder의 마지막 hidden state를 저장
         sequence_output = encoder_outputs[0]
+        
+        # pooling
         pooled_output = (
             self.pooler(sequence_output) if self.pooler is not None else None
         )
@@ -1114,8 +1213,10 @@ class BertLMHeadModel(BertPreTrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
+        # labels가 주어지는 경우, 즉 학습모드인경우 캐시 저장 안함
         if labels is not None:
             use_cache = False
+        # past kv가 제공되면 이전 시퀸스의 정보 사용하므로 query embeds 없어도 ok
         if past_key_values is not None:
             query_embeds = None
 
@@ -1136,9 +1237,12 @@ class BertLMHeadModel(BertPreTrainedModel):
         )
 
         sequence_output = outputs[0]
+        
+        # query_embeds가 제공되었다면, sequence_output의 첫번째 query_embeds만 남겨서 실제 시퀸스의 출력만 남김
         if query_embeds is not None:
             sequence_output = outputs[0][:, query_embeds.shape[1] :, :]
 
+        # 예측 수행
         prediction_scores = self.cls(sequence_output)
 
         if return_logits:
@@ -1147,9 +1251,11 @@ class BertLMHeadModel(BertPreTrainedModel):
         lm_loss = None
         if labels is not None:
             # we are doing next-token prediction; shift prediction scores and input ids by one
+            # 예측 점수와 label을 한 위치씩 이동
             shifted_prediction_scores = prediction_scores[:, :-1, :].contiguous()
             labels = labels[:, 1:].contiguous()
             loss_fct = CrossEntropyLoss(reduction=reduction, label_smoothing=0.1)
+            # 교차 엔트로피 이용해 loss 계산 및 업데이트
             lm_loss = loss_fct(
                 shifted_prediction_scores.view(-1, self.config.vocab_size),
                 labels.view(-1),
@@ -1176,12 +1282,16 @@ class BertLMHeadModel(BertPreTrainedModel):
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
+        
+        # query_embeds와 shape가 동일하고 모든 요소가 1인 새 텐서 생성    
         query_mask = input_ids.new_ones(query_embeds.shape[:-1])
+        
+        # query mask + attention mask로 최종 attention mask 생성 ??? 이 부분이 task에 따라 다르게 적용되는 부분인 것 같은데 왜 prepare_inputs_for_generation()를 사용한 부분이 없는지
         attention_mask = torch.cat([query_mask, attention_mask], dim=-1)
 
         # cut decoder_input_ids if past is used
         if past is not None:
-            input_ids = input_ids[:, -1:]
+            input_ids = input_ids[:, -1:] # past가 제공되면 input_ids에서 마지막 위치의 토큰만 사용
 
         return {
             "input_ids": input_ids,
